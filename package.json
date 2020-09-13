@@ -11,10 +11,10 @@
     "url": "https://github.com/mirumee/saleor/issues"
   },
   "homepage": "http://getsaleor.com/",
-  "dependencies": {},
-  "devDependencies": {
-    "mjml": "^4.6.2"
+  "dependencies": {
+      "mjml": "^4.6.2"
   },
+  "devDependencies": {},
   "scripts": {
     "build-schema": "python manage.py get_graphql_schema > saleor/graphql/schema.graphql",
     "heroku-postbuild": "npm run build-emails",
