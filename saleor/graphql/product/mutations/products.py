@@ -1,4 +1,3 @@
-import datetime
 from collections import defaultdict
 from typing import Iterable, List, Tuple, Union
 
@@ -6,13 +5,12 @@ import graphene
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.db import transaction
 from django.db.models import Q, QuerySet
-from django.utils.text import slugify
+from django.template.defaultfilters import slugify
 from graphene.types import InputObjectType
+from graphql_jwt.exceptions import PermissionDenied
 from graphql_relay import from_global_id
 
-from ....core.exceptions import PermissionDenied
 from ....core.permissions import ProductPermissions
-from ....order import OrderStatus, models as order_models
 from ....product import models
 from ....product.error_codes import ProductErrorCode
 from ....product.tasks import (
@@ -31,7 +29,7 @@ from ....product.utils.attributes import (
     generate_name_for_variant,
 )
 from ...core.mutations import BaseMutation, ModelDeleteMutation, ModelMutation
-from ...core.scalars import PositiveDecimal, WeightScalar
+from ...core.scalars import Decimal, WeightScalar
 from ...core.types import SeoInput, Upload
 from ...core.types.common import ProductError
 from ...core.utils import (
@@ -42,17 +40,9 @@ from ...core.utils import (
     validate_slug_and_generate_if_needed,
 )
 from ...core.utils.reordering import perform_reordering
-from ...core.validators import validate_price_precision
 from ...meta.deprecated.mutations import ClearMetaBaseMutation, UpdateMetaBaseMutation
 from ...warehouse.types import Warehouse
-from ..types import (
-    Category,
-    Collection,
-    Product,
-    ProductImage,
-    ProductType,
-    ProductVariant,
-)
+from ..types import Category, Collection, Product, ProductImage, ProductVariant
 from ..utils import (
     create_stocks,
     get_used_attribute_values_for_variant,
@@ -271,8 +261,6 @@ class MoveProductInput(graphene.InputObjectType):
         description=(
             "The relative sorting position of the product (from -inf to +inf) "
             "starting from the first given product's actual position."
-            "1 moves the item one position forward, -1 moves the item one position "
-            "backward, 0 leaves the item unchanged."
         )
     )
 
@@ -528,6 +516,7 @@ class ProductInput(graphene.InputObjectType):
     )
     name = graphene.String(description="Product name.")
     slug = graphene.String(description="Product slug.")
+    base_price = Decimal(description="Product price.")
     tax_code = graphene.String(description="Tax rate for enabled tax gateway.")
     seo = SeoInput(description="Search engine optimization fields.")
     weight = WeightScalar(description="Weight of the Product.", required=False)
@@ -542,18 +531,6 @@ class ProductInput(graphene.InputObjectType):
             "Determines if the inventory of this product should be tracked. If false, "
             "the quantity won't change when customers buy this item. Note: this field "
             "is only used if a product doesn't use variants."
-        )
-    )
-    base_price = PositiveDecimal(
-        description=(
-            "Default price for product variant. "
-            "Note: this field is only used if a product doesn't use variants."
-        )
-    )
-    visible_in_listings = graphene.Boolean(
-        description=(
-            "Determines if product is visible in product listings "
-            "(doesn't apply to product collections)."
         )
     )
 
@@ -667,9 +644,7 @@ class AttributeAssignmentMixin:
         get_or_create = attribute.values.get_or_create
         return tuple(
             get_or_create(
-                attribute=attribute,
-                slug=slugify(value, allow_unicode=True),
-                defaults={"name": value},
+                attribute=attribute, slug=slugify(value), defaults={"name": value}
             )[0]
             for value in values
         )
@@ -834,17 +809,10 @@ class ProductCreate(ModelMutation):
                 {
                     "weight": ValidationError(
                         "Product can't have negative weight.",
-                        code=ProductErrorCode.INVALID.value,
+                        code=ProductErrorCode.INVALID,
                     )
                 }
             )
-
-        base_price = cleaned_input.get("base_price")
-        try:
-            validate_price_precision(base_price, instance.currency)
-        except ValidationError as error:
-            error.code = ProductErrorCode.INVALID.value
-            raise ValidationError({"base_price": error})
 
         # Attributes are provided as list of `AttributeValueInput` objects.
         # We need to transform them into the format they're stored in the
@@ -863,6 +831,23 @@ class ProductCreate(ModelMutation):
         except ValidationError as error:
             error.code = ProductErrorCode.REQUIRED.value
             raise ValidationError({"slug": error})
+        # Try to get price from "basePrice" or "price" field. Once "price" is removed
+        # from the schema, only "basePrice" should be used here.
+        price = data.get("base_price", data.get("price"))
+        if price is not None:
+            if price < 0:
+                raise ValidationError(
+                    {
+                        "basePrice": ValidationError(
+                            "Product base price cannot be lower than 0.",
+                            code=ProductErrorCode.INVALID,
+                        )
+                    }
+                )
+            cleaned_input["price_amount"] = price
+            if instance.minimal_variant_price_amount is None:
+                # Set the default "minimal_variant_price" to the "price"
+                cleaned_input["minimal_variant_price_amount"] = price
 
         # FIXME  tax_rate logic should be dropped after we remove tax_rate from input
         tax_rate = cleaned_input.pop("tax_rate", "")
@@ -886,9 +871,8 @@ class ProductCreate(ModelMutation):
         if not category and is_published:
             raise ValidationError(
                 {
-                    "category": ValidationError(
-                        "You must select a category to be able to publish",
-                        code=ProductErrorCode.REQUIRED,
+                    "isPublished": ValidationError(
+                        "You must select a category to be able to publish"
                     )
                 }
             )
@@ -968,13 +952,8 @@ class ProductCreate(ModelMutation):
                 "track_inventory", site_settings.track_inventory_by_default
             )
             sku = cleaned_input.get("sku")
-            variant_price = cleaned_input.get("base_price")
-
             variant = models.ProductVariant.objects.create(
-                product=instance,
-                track_inventory=track_inventory,
-                sku=sku,
-                price_amount=variant_price,
+                product=instance, track_inventory=track_inventory, sku=sku
             )
             stocks = cleaned_input.get("stocks")
             if stocks:
@@ -1049,9 +1028,6 @@ class ProductUpdate(ProductCreate):
             if "sku" in cleaned_input:
                 variant.sku = cleaned_input["sku"]
                 update_fields.append("sku")
-            if "base_price" in cleaned_input:
-                variant.price_amount = cleaned_input["base_price"]
-                update_fields.append("price_amount")
             if update_fields:
                 variant.save(update_fields=update_fields)
         # Recalculate the "minimal variant price"
@@ -1060,7 +1036,6 @@ class ProductUpdate(ProductCreate):
         attributes = cleaned_input.get("attributes")
         if attributes:
             AttributeAssignmentMixin.save(instance, attributes)
-        info.context.plugins.product_updated(instance)
 
 
 class ProductDelete(ModelDeleteMutation):
@@ -1073,25 +1048,6 @@ class ProductDelete(ModelDeleteMutation):
         permissions = (ProductPermissions.MANAGE_PRODUCTS,)
         error_type_class = ProductError
         error_type_field = "product_errors"
-
-    @classmethod
-    def perform_mutation(cls, _root, info, **data):
-        node_id = data.get("id")
-        instance = cls.get_node_or_error(info, node_id, only_type=Product)
-
-        # get draft order lines for variant
-        line_pks = list(
-            order_models.OrderLine.objects.filter(
-                variant__in=instance.variants.all(), order__status=OrderStatus.DRAFT
-            ).values_list("pk", flat=True)
-        )
-
-        response = super().perform_mutation(_root, info, **data)
-
-        # delete order lines for deleted variant
-        order_models.OrderLine.objects.filter(pk__in=line_pks).delete()
-
-        return response
 
 
 class ProductUpdateMeta(UpdateMetaBaseMutation):
@@ -1140,8 +1096,8 @@ class ProductVariantInput(graphene.InputObjectType):
         required=False,
         description="List of attributes specific to this variant.",
     )
-    cost_price = PositiveDecimal(description="Cost price of the variant.")
-    price = PositiveDecimal(description="Price of the particular variant.")
+    cost_price = Decimal(description="Cost price of the variant.")
+    price_override = Decimal(description="Special price of the particular variant.")
     sku = graphene.String(description="Stock keeping unit.")
     track_inventory = graphene.Boolean(
         description=(
@@ -1227,31 +1183,29 @@ class ProductVariantCreate(ModelMutation):
 
         if "cost_price" in cleaned_input:
             cost_price = cleaned_input.pop("cost_price")
-            try:
-                validate_price_precision(cost_price, instance.currency)
-            except ValidationError as error:
-                error.code = ProductErrorCode.INVALID.value
-                raise ValidationError({"cost_price": error})
+            if cost_price and cost_price < 0:
+                raise ValidationError(
+                    {
+                        "costPrice": ValidationError(
+                            "Product price cannot be lower than 0.",
+                            code=ProductErrorCode.INVALID.value,
+                        )
+                    }
+                )
             cleaned_input["cost_price_amount"] = cost_price
 
-        price = cleaned_input.get("price")
-        if price is None and instance.price is None:
-            raise ValidationError(
-                {
-                    "price": ValidationError(
-                        "Variant price is required.",
-                        code=ProductErrorCode.REQUIRED.value,
-                    )
-                }
-            )
-
-        if "price" in cleaned_input:
-            try:
-                validate_price_precision(price, instance.currency)
-            except ValidationError as error:
-                error.code = ProductErrorCode.INVALID.value
-                raise ValidationError({"price": error})
-            cleaned_input["price_amount"] = price
+        if "price_override" in cleaned_input:
+            price_override = cleaned_input.pop("price_override")
+            if price_override and price_override < 0:
+                raise ValidationError(
+                    {
+                        "priceOverride": ValidationError(
+                            "Product price cannot be lower than 0.",
+                            code=ProductErrorCode.INVALID.value,
+                        )
+                    }
+                )
+            cleaned_input["price_override_amount"] = price_override
 
         stocks = cleaned_input.get("stocks")
         if stocks:
@@ -1336,7 +1290,6 @@ class ProductVariantCreate(ModelMutation):
             AttributeAssignmentMixin.save(instance, attributes)
             instance.name = generate_name_for_variant(instance)
             instance.save(update_fields=["name"])
-        info.context.plugins.product_updated(instance.product)
 
     @classmethod
     def create_variant_stocks(cls, variant, stocks):
@@ -1398,25 +1351,6 @@ class ProductVariantDelete(ModelDeleteMutation):
         # Update the "minimal_variant_prices" of the parent product
         update_product_minimal_variant_price_task.delay(instance.product_id)
         return super().success_response(instance)
-
-    @classmethod
-    def perform_mutation(cls, _root, info, **data):
-        node_id = data.get("id")
-        variant_pk = from_global_id_strict_type(node_id, ProductVariant, field="pk")
-
-        # get draft order lines for variant
-        line_pks = list(
-            order_models.OrderLine.objects.filter(
-                variant__pk=variant_pk, order__status=OrderStatus.DRAFT
-            ).values_list("pk", flat=True)
-        )
-
-        response = super().perform_mutation(_root, info, **data)
-
-        # delete order lines for deleted variant
-        order_models.OrderLine.objects.filter(pk__in=line_pks).delete()
-
-        return response
 
 
 class ProductVariantUpdateMeta(UpdateMetaBaseMutation):
@@ -1545,12 +1479,10 @@ class ProductTypeCreate(ModelMutation):
     @classmethod
     def _save_m2m(cls, info, instance, cleaned_data):
         super()._save_m2m(info, instance, cleaned_data)
-        product_attributes = cleaned_data.get("product_attributes")
-        variant_attributes = cleaned_data.get("variant_attributes")
-        if product_attributes is not None:
-            instance.product_attributes.set(product_attributes)
-        if variant_attributes is not None:
-            instance.variant_attributes.set(variant_attributes)
+        if "product_attributes" in cleaned_data:
+            instance.product_attributes.set(cleaned_data["product_attributes"])
+        if "variant_attributes" in cleaned_data:
+            instance.variant_attributes.set(cleaned_data["variant_attributes"])
 
 
 class ProductTypeUpdate(ProductTypeCreate):
@@ -1587,27 +1519,6 @@ class ProductTypeDelete(ModelDeleteMutation):
         permissions = (ProductPermissions.MANAGE_PRODUCTS,)
         error_type_class = ProductError
         error_type_field = "product_errors"
-
-    @classmethod
-    def perform_mutation(cls, _root, info, **data):
-        node_id = data.get("id")
-        product_type_pk = from_global_id_strict_type(node_id, ProductType, field="pk")
-        variants_pks = models.Product.objects.filter(
-            product_type__pk=product_type_pk
-        ).values_list("variants__pk", flat=True)
-        # get draft order lines for products
-        order_line_pks = list(
-            order_models.OrderLine.objects.filter(
-                variant__pk__in=variants_pks, order__status=OrderStatus.DRAFT
-            ).values_list("pk", flat=True)
-        )
-
-        response = super().perform_mutation(_root, info, **data)
-
-        # delete order lines for deleted variants
-        order_models.OrderLine.objects.filter(pk__in=order_line_pks).delete()
-
-        return response
 
 
 class ProductTypeUpdateMeta(UpdateMetaBaseMutation):
@@ -1892,60 +1803,3 @@ class VariantImageUnassign(BaseMutation):
             variant_image.delete()
 
         return VariantImageUnassign(product_variant=variant, image=image)
-
-
-class ProductSetAvailabilityForPurchase(BaseMutation):
-    product = graphene.Field(Product)
-
-    class Arguments:
-        product_id = graphene.ID(
-            required=True,
-            description=(
-                "Id of product that availability for purchase should be changed."
-            ),
-        )
-        is_available = graphene.Boolean(
-            description="Determine if product should be available for purchase.",
-            required=True,
-        )
-        start_date = graphene.Date(
-            description=(
-                "A start date from which a product will be available for purchase. "
-                "When not set and isAvailable is set to True, "
-                "the current day is assumed."
-            ),
-            required=False,
-        )
-
-    class Meta:
-        description = "Set product availability for purchase date."
-        permissions = (ProductPermissions.MANAGE_PRODUCTS,)
-        error_type_class = ProductError
-        error_type_field = "product_errors"
-
-    @classmethod
-    def perform_mutation(cls, _root, info, **data):
-        product = cls.get_node_or_error(info, data.get("product_id"), only_type=Product)
-        is_available = data.get("is_available")
-        start_date = data.get("start_date")
-
-        if start_date and not is_available:
-            raise ValidationError(
-                {
-                    "start_date": ValidationError(
-                        "Cannot set start date when isAvailable is false.",
-                        code=ProductErrorCode.INVALID,
-                    )
-                }
-            )
-
-        if not is_available:
-            product.available_for_purchase = None
-        elif is_available and not start_date:
-            product.available_for_purchase = datetime.date.today()
-        else:
-            product.available_for_purchase = start_date
-
-        product.save(update_fields=["available_for_purchase", "updated_at"])
-        info.context.plugins.product_updated(product)
-        return ProductSetAvailabilityForPurchase(product=product)

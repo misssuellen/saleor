@@ -1,12 +1,11 @@
 import graphene
 from django.core.exceptions import ValidationError
-from django.db import transaction
 from graphene.types import InputObjectType
 
 from ....account.models import User
 from ....core.exceptions import InsufficientStock
 from ....core.permissions import OrderPermissions
-from ....core.taxes import TaxError, zero_taxed_money
+from ....core.taxes import zero_taxed_money
 from ....order import OrderStatus, events, models
 from ....order.actions import order_created
 from ....order.error_codes import OrderErrorCode
@@ -22,7 +21,7 @@ from ....warehouse.management import allocate_stock
 from ...account.i18n import I18nMixin
 from ...account.types import AddressInput
 from ...core.mutations import BaseMutation, ModelDeleteMutation, ModelMutation
-from ...core.scalars import PositiveDecimal
+from ...core.scalars import Decimal
 from ...core.types.common import OrderError
 from ...product.types import ProductVariant
 from ..types import Order, OrderLine
@@ -47,7 +46,7 @@ class DraftOrderInput(InputObjectType):
         descripton="Customer associated with the draft order.", name="user"
     )
     user_email = graphene.String(description="Email address of the customer.")
-    discount = PositiveDecimal(description="Discount amount for the order.")
+    discount = Decimal(description="Discount amount for the order.")
     shipping_address = AddressInput(description="Shipping address of the customer.")
     shipping_method = graphene.ID(
         description="ID of a selected shipping method.", name="shippingMethod"
@@ -174,7 +173,6 @@ class DraftOrderCreate(ModelMutation, I18nMixin):
             update_order_prices(instance, info.context.discounts)
 
     @classmethod
-    @transaction.atomic
     def save(cls, info, instance, cleaned_input):
         new_instance = not bool(instance.pk)
 
@@ -184,21 +182,15 @@ class DraftOrderCreate(ModelMutation, I18nMixin):
         # Save any changes create/update the draft
         cls._commit_changes(info, instance, cleaned_input)
 
-        try:
-            # Process any lines to add
-            cls._save_lines(
-                info,
-                instance,
-                cleaned_input.get("quantities"),
-                cleaned_input.get("variants"),
-            )
+        # Process any lines to add
+        cls._save_lines(
+            info,
+            instance,
+            cleaned_input.get("quantities"),
+            cleaned_input.get("variants"),
+        )
 
-            cls._refresh_lines_unit_price(info, instance, cleaned_input, new_instance)
-        except TaxError as tax_error:
-            raise ValidationError(
-                "Unable to calculate taxes - %s" % str(tax_error),
-                code=OrderErrorCode.TAX_ERROR.value,
-            )
+        cls._refresh_lines_unit_price(info, instance, cleaned_input, new_instance)
 
         # Post-process the results
         recalculate_order(instance)
@@ -345,16 +337,10 @@ class DraftOrderLinesCreate(BaseMutation):
                 )
 
         # Add the lines
-        try:
-            lines = [
-                add_variant_to_draft_order(order, variant, quantity)
-                for quantity, variant in lines_to_add
-            ]
-        except TaxError as tax_error:
-            raise ValidationError(
-                "Unable to calculate taxes - %s" % str(tax_error),
-                code=OrderErrorCode.TAX_ERROR.value,
-            )
+        lines = [
+            add_variant_to_draft_order(order, variant, quantity)
+            for quantity, variant in lines_to_add
+        ]
 
         # Create the event
         events.draft_order_added_products_event(
