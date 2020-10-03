@@ -2,6 +2,7 @@ version: "1.0"
 stages:
   - "clone"
   - "build"
+  - "deploy"
 
 steps:
   clone:
@@ -20,4 +21,12 @@ steps:
     tag: "${{CF_BRANCH_TAG_NORMALIZED}}"
     dockerfile: "Dockerfile"
     stage: "build"
-
+  deploy:
+    title: "deploying to cluster"
+    type: "deploy"
+    stage: "deploy"
+    arguments:
+      kind: "kubernetes"
+      cluster: "saleor"
+      namespace: "store"
+      service: "store-stack"
